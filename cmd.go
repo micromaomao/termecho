@@ -14,8 +14,10 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/pkg/term/termios"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -60,10 +62,15 @@ func main() {
 	}
 
 	wsize := C.struct_winsize{}
-
 	syscall.Syscall6(syscall.SYS_IOCTL, 0, syscall.TIOCGWINSZ, uintptr(unsafe.Pointer(&wsize)), 0, 0, 0)
-
 	fmt.Fprintf(os.Stderr, "%v by %v terminal, cursor at row %v, col %v.\n\rPress any key. q to exit.\n\r", wsize.ws_row, wsize.ws_col, initRow, initCol)
+
+	writeLocker := &sync.Mutex{}
+	resizeSignalChan := make(chan os.Signal)
+	exitChannel := make(chan bool)
+	exitWait := make(chan bool)
+	go resizeHandlerThread(resizeSignalChan, writeLocker, exitChannel, exitWait)
+	signal.Notify(resizeSignalChan, syscall.SIGWINCH)
 
 	b := []byte{0}
 	for {
@@ -84,6 +91,7 @@ func main() {
 		if b[0] == 'Q' {
 			additionalInfo = " (press small q to exit)"
 		}
+		writeLocker.Lock()
 		if b[0] == '\033' {
 			buf := make([]byte, 100)
 			rl, _ := inBufio.Read(buf)
@@ -92,7 +100,29 @@ func main() {
 		} else {
 			fmt.Fprintf(os.Stderr, "\033[1A\033[2K\rRead byte %v (%v)%v\n\r", b[0], strconv.QuoteRune(rune(b[0])), additionalInfo)
 		}
+		writeLocker.Unlock()
 	}
-
+	exitChannel <- true
+	_ = <-exitWait
+	writeLocker.Lock()
 	fmt.Fprintf(os.Stderr, "\033[2A\033[0J")
+	writeLocker.Unlock()
+}
+
+func resizeHandlerThread(ch chan os.Signal, writeLocker sync.Locker, exit chan bool, exitDone chan bool) {
+	for {
+		select {
+		case <-exit:
+			exitDone <- true
+			return
+		case sig := <-ch:
+			if sig == syscall.SIGWINCH {
+				writeLocker.Lock()
+				wsize := C.struct_winsize{}
+				syscall.Syscall6(syscall.SYS_IOCTL, 0, syscall.TIOCGWINSZ, uintptr(unsafe.Pointer(&wsize)), 0, 0, 0)
+				fmt.Fprintf(os.Stderr, "\033[2A\033[0J\rResized to %v by %v\n\rPress any key. q to exit.\n\r", wsize.ws_row, wsize.ws_col)
+				writeLocker.Unlock()
+			}
+		}
+	}
 }
